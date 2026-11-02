@@ -1,0 +1,71 @@
+name: Build UK map pack
+
+on:
+  schedule:
+    # Monthly, early on the 2nd, after Geofabrik's overnight extract.
+    - cron: "17 4 2 * *"
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Geofabrik extract path (a county is quicker for a trial)
+        default: europe/united-kingdom
+      trial:
+        description: Publish as a pre-release that the app ignores
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REGION: ${{ inputs.region || 'europe/united-kingdom' }}
+      TRIAL: ${{ inputs.trial || false }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test
+      - run: sudo apt-get update && sudo apt-get install -y osmium-tool
+      - name: Download extract
+        run: curl -fsSL --retry 3 -o extract.osm.pbf "https://download.geofabrik.de/${REGION}-latest.osm.pbf"
+      - name: Keep highways and gates
+        run: |
+          echo "SNAPSHOT=$(osmium fileinfo -g header.option.osmosis_replication_timestamp extract.osm.pbf)" >> "$GITHUB_ENV"
+          osmium tags-filter extract.osm.pbf w/highway n/barrier=gate,lift_gate,swing_gate,chain -o highways.osm.pbf
+          rm extract.osm.pbf
+      - name: Build pack
+        run: |
+          osmium add-locations-to-ways highways.osm.pbf -f opl,add_metadata=false -o - \
+            | node --max-old-space-size=8192 build-pack.mjs uk-highways.sgmap "OpenStreetMap via Geofabrik ${REGION}, ${SNAPSHOT}"
+          ls -l uk-highways.sgmap
+      - name: Publish release
+        run: |
+          stamp=$(date -u +%Y-%m-%d-%H%M)
+          if [ "$TRIAL" = "true" ]; then
+            gh release create "trial-$stamp" uk-highways.sgmap --prerelease --title "Trial: ${REGION} ${SNAPSHOT}" \
+              --notes "Trial build; the app only reads the latest full release."
+          else
+            gh release create "uk-$stamp" uk-highways.sgmap --latest --title "UK highways ${SNAPSHOT}" \
+              --notes "Highways and gates from OpenStreetMap (${SNAPSHOT}). © OpenStreetMap contributors, ODbL 1.0."
+          fi
+      - name: Remove old releases
+        # Keep the newest three full releases so a running server's pinned
+        # pack stays readable during a changeover; trials go after a week.
+        run: |
+          gh release list --limit 100 --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease | not)] | sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | xargs -r -n1 gh release delete --yes --cleanup-tag
+          cutoff=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh release list --limit 100 --json tagName,isPrerelease,createdAt \
+            --jq ".[] | select(.isPrerelease and .createdAt < \"$cutoff\") | .tagName" \
+            | xargs -r -n1 gh release delete --yes --cleanup-tag

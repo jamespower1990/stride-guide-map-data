@@ -80,9 +80,10 @@ export function encodePackHeader(meta, entries) {
 const intersects = (a, b) => a.south <= b.north && a.north >= b.south && a.west <= b.east && a.east >= b.west;
 
 export function createMapPack({ url, fetchImpl = fetch, now = Date.now, refreshMs = 6 * 60 * 60 * 1000,
-  timeoutMs = 15000, maxBytesPerRequest = 32 * 1024 * 1024 } = {}) {
+  retryMs = 10 * 60 * 1000, timeoutMs = 15000, maxBytesPerRequest = 32 * 1024 * 1024 } = {}) {
   let loaded = null;
   let loading = null;
+  let unavailableUntil = 0;
   let hits = 0;
   let misses = 0;
   let errors = 0;
@@ -131,6 +132,9 @@ export function createMapPack({ url, fetchImpl = fetch, now = Date.now, refreshM
 
   async function current() {
     if (loaded && now() - loaded.loadedAt < refreshMs) return loaded;
+    // With no pack at all (none published yet, or GitHub unreachable), do not
+    // add a doomed lookup to every search.
+    if (!loaded && now() < unavailableUntil) throw new Error(lastError || "Map pack unavailable");
     loading ||= load().then((value) => { loaded = value; return value; }).finally(() => { loading = null; });
     try {
       return await loading;
@@ -141,6 +145,7 @@ export function createMapPack({ url, fetchImpl = fetch, now = Date.now, refreshM
         loaded.loadedAt = now();
         return loaded;
       }
+      unavailableUntil = now() + retryMs;
       throw error;
     }
   }
